@@ -50,17 +50,22 @@ def load_cookies(driver):
 
 def get_driver():
     options = Options()
-    options.add_argument("--headless=new")
+    options.add_argument("--headless")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/115 Safari/537.36")
-    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    options.page_load_strategy = 'eager'
+
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    driver.set_page_load_timeout(60)
+    return driver
 
 def extract_price_from_selectors(driver_or_item, selectors):
     for selector in selectors:
         try:
-            elements = driver_or_item.find_elements(By.CSS_SELECTOR, selector)
+            elements = driver_or_item.find_elements(By.XPATH, ".//" + selector.replace(".", "").replace(" ", "//"))
             for el in elements:
                 text = el.get_attribute("innerText") or el.text
                 if not text:
@@ -68,11 +73,24 @@ def extract_price_from_selectors(driver_or_item, selectors):
                 text = text.replace("\xa0", " ").replace("TL", " TL").strip()
                 text = re.sub(r"\s+", " ", text)
 
-                if any(x in text.lower() for x in ["puan", "teslimat", "sipariş", "beğenilen", "kargo", "teklif"]):
+                if any(x in text.lower() for x in [
+                    "puan", "teslimat", "sipariş", "beğenilen", "kargo", "teklif",
+                    "bedeli", "indirim", "kupon", "kampanya", "ödül"
+                ]):
                     continue
 
-                if re.search(r"\d{1,3}(\.\d{3})*,\d{2} TL", text):
-                    return text
+                if not re.search(r"\d{1,3}(\.\d{3})*,\d{2} TL", text):
+                    continue
+
+                try:
+                    val = float(text.replace("TL", "").replace(".", "").replace(",", ".").strip())
+                    if val < 500 or val > 100_000:
+                        print(f"⚠️ Şüpheli fiyat dışlandı: {text}")
+                        continue
+                except:
+                    continue
+
+                return text
         except:
             continue
     return None
@@ -85,6 +103,20 @@ def get_offer_listing_link(driver):
             return "https://www.amazon.com.tr" + href
         return href
     except:
+        return None
+
+def get_used_price_if_available(driver):
+    try:
+        container = driver.find_element(
+            By.XPATH,
+            "//div[contains(@class, 'a-column') and .//span[contains(text(), 'İkinci El Ürün Satın Al:')]]"
+        )
+        price_element = container.find_element(By.CLASS_NAME, "offer-price")
+        price = price_element.text.strip()
+        print(f"📦 İkinci El Fiyat bulundu: {price}")
+        return price
+    except:
+        print("⛔ İkinci El fiyat bloğu bulunamadı")
         return None
 
 def get_final_price(driver, link):
@@ -106,7 +138,12 @@ def get_final_price(driver, link):
         driver.get(link)
         WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
         time.sleep(2)
-
+        driver.execute_script("""
+          document.querySelectorAll("h2.a-carousel-heading").forEach(h => {
+            let box = h.closest("div");
+            if (box) box.remove();
+          });
+        """)
         price = extract_price_from_selectors(driver, price_selectors_detail)
         if price:
             driver.close()
@@ -119,10 +156,20 @@ def get_final_price(driver, link):
             WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "body")))
             time.sleep(2)
             price = extract_price_from_selectors(driver, price_selectors_offer)
+            if price:
+                driver.close()
+                driver.switch_to.window(driver.window_handles[0])
+                return price
+
+        used_price = get_used_price_if_available(driver)
+        if used_price:
+            driver.close()
+            driver.switch_to.window(driver.window_handles[0])
+            return used_price
 
         driver.close()
         driver.switch_to.window(driver.window_handles[0])
-        return price
+        return None
     except Exception as e:
         print(f"⚠️ Sekme fallback hatası: {e}")
         try:
@@ -131,7 +178,6 @@ def get_final_price(driver, link):
         except:
             pass
         return None
-
 def load_sent_data():
     data = {}
     if os.path.exists(SENT_FILE):
@@ -153,10 +199,23 @@ def run():
         return
 
     driver = get_driver()
-    driver.get(URL)
+
+    try:
+        driver.get(URL)
+    except Exception as e:
+        print(f"⚠️ İlk sayfa yüklenemedi: {e}")
+        driver.quit()
+        return
+
     time.sleep(2)
     load_cookies(driver)
-    driver.get(URL)
+
+    try:
+        driver.get(URL)
+    except Exception as e:
+        print(f"⚠️ Cookie sonrası sayfa yüklenemedi: {e}")
+        driver.quit()
+        return
 
     try:
         WebDriverWait(driver, 30).until(
@@ -181,7 +240,7 @@ def run():
         try:
             heading_check = item.find_elements(By.XPATH, ".//preceding::h5[contains(text(), 'Aradığınızı bulamadınız mı?')]")
             if heading_check:
-                continue  # öneri kutusu → dışla
+                continue
 
             if item.find_elements(By.XPATH, ".//span[contains(text(), 'Sponsorlu')]"):
                 continue
